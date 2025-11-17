@@ -6,8 +6,20 @@ from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, BatchNorm1
 from torch_geometric.nn.inits import glorot, reset
 from torch_geometric.utils import dropout_node
 from torch_geometric.nn import GraphNorm
-from torch_scatter import scatter_add
 from Models.GNN import APHetNet, MLP
+
+# Try to import scatter_add, fallback to native torch
+try:
+    from torch_scatter import scatter_add
+except ImportError:
+    def scatter_add(src, index, dim, dim_size=None):
+        """Fallback scatter_add using torch.scatter_add_"""
+        if dim != 0:
+            raise NotImplementedError("Fallback only supports dim=0")
+        if dim_size is None:
+            dim_size = index.max().item() + 1
+        out = torch.zeros(dim_size, src.shape[1], device=src.device, dtype=src.dtype)
+        return torch.scatter_add_(out, 0, index.unsqueeze(1).expand_as(src), src)
 
 
 class LDPCConvLayer(nn.Module):
