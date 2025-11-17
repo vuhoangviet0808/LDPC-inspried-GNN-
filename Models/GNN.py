@@ -1,0 +1,338 @@
+import torch
+import numpy as np
+import torch.nn as nn
+from torch_geometric.nn.conv import MessagePassing
+from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, BatchNorm1d as BN, LayerNorm, Dropout, GELU, LeakyReLU
+from torch_geometric.nn.inits import glorot, reset
+from torch_geometric.utils import dropout_node
+from torch_geometric.nn import GraphNorm
+from torch_scatter import scatter_add
+
+def MLP(channels, batch_norm=False, dropout_prob=0):
+    layers = []
+    for i in range(1, len(channels)):
+        layers.append(Seq(Lin(channels[i - 1], channels[i])))
+        if batch_norm:
+            # layers.append(BN(channels[i]))
+            layers.append(LayerNorm(channels[i]))
+        if dropout_prob:
+            layers.append(Dropout(dropout_prob))  # Add dropout after batch norm or activation
+        # layers.append(ReLU())
+        # layers.append(GELU())
+        # layers.append(nn.SiLU()) # Shit
+        layers.append(LeakyReLU(negative_slope=0.1))
+    # layers.append(Dropout(0.3))
+
+    return Seq(*layers)
+    
+    
+# Heterogeneous GNN
+class APConvLayer(MessagePassing):
+    def __init__(
+            self,
+            src_dim_dict,
+            edge_dim,
+            out_channel,
+            init_channel,
+            metadata,
+            edge_conv=False,
+            **kwargs
+    ):
+        super().__init__(aggr='mean', **kwargs)
+        self.edge_conv = edge_conv
+        self.metadata = metadata
+        self.src_init_dict = init_channel
+        self.edge_init = init_channel['edge']
+        self.out_channel = out_channel
+        self.src_dim_dict = src_dim_dict
+
+        self.msg = nn.ModuleDict() 
+        self.upd = nn.ModuleDict() 
+        
+        self.gamma = nn.ParameterDict()
+        self.gamma_edge = nn.ParameterDict()
+        
+        hidden = out_channel//2
+        for edge_type in metadata:
+            src_type, _, dst_type = edge_type
+            src_dim = src_dim_dict[src_type]
+            dst_dim = src_dim_dict[dst_type]
+            src_init = init_channel[src_type]
+            dst_init = init_channel[dst_type]
+            self.msg[src_type] = MLP([src_dim + edge_dim + dst_dim, out_channel], batch_norm=False, dropout_prob=0)
+            self.upd[dst_type] = MLP([out_channel + dst_dim, out_channel - dst_init], batch_norm=False, dropout_prob=0)
+            
+            self.gamma[dst_type] = nn.Parameter(torch.full((out_channel - dst_init,), 1e-3))
+            
+        if self.edge_conv:
+            self.edge_upd= MLP([sum(src_dim_dict.values()) + edge_dim, out_channel - self.edge_init], batch_norm=False, dropout_prob=0)
+            self.gamma_edge = nn.Parameter(torch.full((out_channel - self.edge_init,), 1e-3))
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        reset(self.msg)
+        reset(self.upd)
+        reset(self.gamma)
+        if self.edge_conv:
+            reset(self.edge_upd)
+            reset(self.gamma_edge)
+
+    def forward(
+            self,
+            x_dict,
+            edge_index_dict,
+            edge_attr_dict
+    ):
+        for edge_type, edge_index in edge_index_dict.items():
+            if edge_type not in self.metadata: continue;
+            src_type, _, dst_type = edge_type
+
+            x_src = x_dict[src_type]
+            x_dst = x_dict[dst_type]
+
+            # Node update
+            out = self.propagate(edge_index, x=(x_src, x_dst), edge_attr=edge_attr_dict[edge_type], edge_type=edge_type)
+            tmp = torch.cat([x_dst, out], dim=1)
+            tmp = self.upd[dst_type](tmp)
+            src_init_dim = self.src_init_dict[dst_type]
+            if self.src_dim_dict[dst_type] == self.out_channel:
+                tmp = tmp + self.gamma[dst_type] * x_dst[:,src_init_dim:]
+            x_dict[dst_type] = torch.cat([x_dst[:,:src_init_dim], tmp], dim=1)
+            
+            # Edge update
+            if self.edge_conv:
+                edge_attr_dict[edge_type] = self.edge_updater(edge_index, x=(x_src, x_dst), edge_attr=edge_attr_dict[edge_type])
+        return x_dict, edge_attr_dict
+
+    def message(self, x_j, x_i, edge_attr, edge_type):
+        # x_j: source node
+        # x_i: destination node
+        src_type, _, dst_type = edge_type
+        out = torch.cat([x_j, edge_attr, x_i], dim=1)
+        out = self.msg[src_type](out)
+        return out
+
+    def edge_update(self, x_j, x_i, edge_attr):
+        tmp = torch.cat([x_j, edge_attr, x_i], dim=1)
+        out = self.edge_upd(tmp)
+        if self.out_channel == self.edge_init:
+            out = out + self.gamma_edge * edge_attr
+        out = torch.cat([edge_attr[:,:self.edge_init], out], dim=1)
+        return out
+
+
+class APHetNet(nn.Module):
+    def __init__(self, metadata, dim_dict, out_channels, num_layers=0, hid_layers=4, edge_conv=False):
+        super(APHetNet, self).__init__()
+        self.edge_conv = edge_conv
+        src_dim_dict = dim_dict
+
+        self.ue_dim = src_dim_dict['UE']
+        self.ap_dim = src_dim_dict['AP']
+        self.edge_dim = src_dim_dict['edge']
+
+        self.convs = torch.nn.ModuleList()
+        # First Layer to update RRU
+        self.convs.append(
+            APConvLayer(
+                {'UE': self.ue_dim, 'AP': self.ap_dim},
+                self.edge_dim,
+                out_channels, src_dim_dict,
+                [('UE', 'up', 'AP')],
+                edge_conv=edge_conv
+            )
+        )
+        
+        self.convs.append(
+            APConvLayer(
+                {'UE': self.ue_dim, 'AP': out_channels},
+                self.edge_dim,
+                out_channels, src_dim_dict,
+                [('AP', 'down', 'UE')],
+                edge_conv=edge_conv
+            )
+        )
+        for _ in range(num_layers):
+            if self.edge_conv:
+                conv = APConvLayer(
+                    {'UE': out_channels, 'AP': out_channels}, 
+                    out_channels, out_channels, src_dim_dict, 
+                    [('UE', 'up', 'AP'), ('AP', 'down', 'UE')],
+                    edge_conv=edge_conv
+                )
+            else:
+                conv = APConvLayer(
+                    {'UE': out_channels, 'AP': out_channels}, 
+                    self.edge_dim, out_channels, src_dim_dict, 
+                    [('UE', 'up', 'AP'), ('AP', 'down', 'UE')]
+                )
+            self.convs.append(conv)
+
+
+        hid = hid_layers # too much is not good - 8 is bad, 4 is currently good
+        
+        # self.AP_gen = MLP([out_channels, hid], batch_norm=False, dropout_prob=0.1)
+        # self.AP_gen = nn.Sequential(*[self.AP_gen, Seq(Lin(hid, 1)), Sigmoid()])
+        
+        if self.edge_conv:
+            self.power_edge = MLP([out_channels, hid], batch_norm=True, dropout_prob=0) #  many layer => shit
+            self.power_edge = nn.Sequential(
+                *[
+                    self.power_edge, Seq(Lin(hid, 1)), # sigmoid is not correct
+                    # Sigmoid(),
+                    #  nn.Softplus(),
+                    #  nn.LeakyReLU(0.1),
+                    #  nn.SiLU(0.1)
+                ]
+            )
+            
+        else:
+            self.power = MLP([out_channels, hid], batch_norm=True, dropout_prob=0)
+            self.power = nn.Sequential(*[self.power, Seq(Lin(hid, 1)), Sigmoid()])
+            # self.power = nn.Sequential(*[self.power, Seq(Lin(hid, 1))])
+
+        # self.norms = nn.ModuleDict({
+        #     'UE': GraphNorm(out_channels),
+        #     'AP': GraphNorm(out_channels)
+        # })
+    def forward(self, batch):
+        x_dict, edge_index_dict, edge_attr_dict = batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict
+        for conv in self.convs:
+            x_dict, edge_attr_dict = conv(x_dict, edge_index_dict, edge_attr_dict)
+        # x_dict['UE'] = self.norms['UE'](x_dict['UE'])
+        # x_dict['AP'] = self.norms['AP'](x_dict['AP'])
+
+        
+        if self.edge_conv:
+            edge_power = self.power_edge(edge_attr_dict[('AP', 'down', 'UE')])
+            # edge_power = torch.exp(edge_power)
+            edge_attr_dict[('AP', 'down', 'UE')] = torch.cat([edge_attr_dict[('AP', 'down', 'UE')][:,:self.edge_dim], edge_power], dim=1)
+        else:
+            dl_power = torch.exp(self.power(x_dict['UE']))
+            x_dict['UE'] = torch.cat([x_dict['UE'][:,:self.ue_dim], dl_power], dim=1)
+        # x_dict['AP'] = self.AP_gen(x_dict['AP'])
+
+        return x_dict, edge_attr_dict, edge_index_dict
+
+
+class LDPCConvLayer(nn.Module):
+    """
+    LDPC-inspired message passing layer.
+
+    It builds a virtual bipartite factor graph between UEs (variable nodes) and
+    parity/check nodes (CHK) and performs a few LDPC-like iterations of
+    variable-to-check and check-to-variable message passing.
+
+    This implementation is intentionally minimal and designed to plug into
+    existing heterogeneous networks: it uses UE features only and returns an
+    updated UE feature tensor; CHK nodes are internal and built per-batch.
+    """
+    def __init__(self, ue_dim, chk_dim, edge_dim, out_channel, num_checks=8, degree=3, num_iter=2):
+        super(LDPCConvLayer, self).__init__()
+        self.ue_dim = ue_dim
+        self.chk_dim = chk_dim
+        self.edge_dim = edge_dim
+        self.out_channel = out_channel
+        self.num_checks = num_checks
+        self.degree = degree
+        self.num_iter = num_iter
+
+        # MLPs for messages
+        self.v2c = MLP([ue_dim + edge_dim + chk_dim, out_channel], batch_norm=False, dropout_prob=0)
+        self.c2v = MLP([out_channel + chk_dim + ue_dim, out_channel], batch_norm=False, dropout_prob=0)
+
+        # Node update for UE
+        self.update_ue = MLP([out_channel + ue_dim, out_channel], batch_norm=False, dropout_prob=0)
+        self.gamma = nn.Parameter(torch.full((out_channel - ue_dim if out_channel>ue_dim else 1,), 1e-3))
+
+    def forward(self, x_ue, batch):
+        # x_ue: [total_UES, ue_dim]
+        device = x_ue.device
+        num_graphs = batch.num_graphs
+        num_ues_total = x_ue.shape[0]
+        if num_ues_total % num_graphs != 0:
+            raise ValueError("UEs must be divisible by graphs in batch")
+        num_ues = num_ues_total // num_graphs
+
+        # build CHK nodes per graph
+        total_chks = num_graphs * self.num_checks
+        x_chk = torch.zeros((total_chks, self.chk_dim), device=device)
+
+        # prepare random bipartite edges (UE -> CHK) per graph
+        srcs = []
+        dsts = []
+        for g in range(num_graphs):
+            ue_offset = g * num_ues
+            chk_offset = g * self.num_checks
+            for chk in range(self.num_checks):
+                # pick `degree` random UEs from this graph
+                uidx = torch.randperm(num_ues, device=device)[:self.degree] + ue_offset
+                srcs.append(uidx)
+                dsts.append(torch.full((self.degree,), chk + chk_offset, device=device, dtype=torch.long))
+
+        if len(srcs) == 0:
+            return x_ue
+
+        src_flat = torch.cat(srcs).long()
+        dst_flat = torch.cat(dsts).long()
+        edge_index = torch.stack([src_flat, dst_flat], dim=0)
+
+        # simple (zero) edge attributes
+        edge_attr = torch.zeros((edge_index.shape[1], self.edge_dim), device=device)
+
+        # Now LDPC-like message passing for num_iter iterations
+        for _ in range(self.num_iter):
+            # V -> C messages (per edge)
+            x_src = x_ue[edge_index[0]]
+            x_dst = x_chk[edge_index[1]]
+            m_v2c = self.v2c(torch.cat([x_src, edge_attr, x_dst], dim=1))
+
+            # aggregate at check nodes
+            chk_agg = scatter_add(m_v2c, edge_index[1], dim=0, dim_size=total_chks)
+
+            # extrinsic messages: for each edge, remove its own contribution
+            ext = chk_agg[edge_index[1]] - m_v2c
+
+            # C -> V messages
+            m_c2v = self.c2v(torch.cat([ext, x_chk[edge_index[1]], x_src], dim=1))
+
+            # aggregate at UE nodes
+            ue_agg = scatter_add(m_c2v, edge_index[0], dim=0, dim_size=num_ues_total)
+
+            # update UE features
+            tmp = torch.cat([x_ue, ue_agg], dim=1)
+            tmp = self.update_ue(tmp)
+            # simple residual/gating
+            if x_ue.shape[1] < tmp.shape[1]:
+                x_ue = torch.cat([x_ue[:,:x_ue.shape[1]], tmp], dim=1)
+            else:
+                x_ue = x_ue + tmp
+
+        return x_ue
+
+
+class LDPCHetNet(APHetNet):
+        """
+        AP + LDPC hybrid network.
+
+        - Runs the APHetNet message passing for AP-UE interactions
+        - Adds an LDPC-inspired bipartite factor graph among UEs
+            to perform constraint-like message passing.
+        """
+        def __init__(self, metadata, dim_dict, out_channels, num_layers=0, hid_layers=4, edge_conv=False,
+                                 num_checks=8, chk_degree=3, ldpc_iter=2):
+                super(LDPCHetNet, self).__init__(metadata, dim_dict, out_channels, num_layers, hid_layers, edge_conv)
+                # We'll take UE dim as variable node dimension
+                self.ldpc = LDPCConvLayer(ue_dim=out_channels, chk_dim=out_channels, edge_dim=self.edge_dim,
+                                                                    out_channel=out_channels, num_checks=num_checks, degree=chk_degree, num_iter=ldpc_iter)
+
+        def forward(self, batch):
+                # First APHetNet computations
+                x_dict, edge_attr_dict, edge_index_dict = super(LDPCHetNet, self).forward(batch)
+
+                # Now do LDPC-inspired updates on UE features
+                x_ue = x_dict['UE']
+                x_ue = self.ldpc(x_ue, batch)
+                x_dict['UE'] = x_ue
+
+                return x_dict, edge_attr_dict, edge_index_dict
