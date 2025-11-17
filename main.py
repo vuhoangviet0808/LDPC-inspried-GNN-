@@ -15,6 +15,7 @@ from Utils.decentralized_train import (
 )
 from Utils.data_gen import Generate_Input, create_graph, build_loader
 from Models.GNN import APHetNet
+from Models.LDPC_GNN import LDPCHetNet
 from torch_geometric.loader import DataLoader
 from Utils.comm import variance_calculate, rate_calculation, component_calculate, rate_from_component
 import matplotlib.pyplot as plt
