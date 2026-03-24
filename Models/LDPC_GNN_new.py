@@ -14,18 +14,6 @@ def MLP(channels, batch_norm=False, dropout_prob=0):
         layers.append(LeakyReLU(negative_slope=0.1))
     return Seq(*layers)
 
-# scatter_add fallback
-try:
-    from torch_scatter import scatter_add
-except Exception:
-    def scatter_add(src, index, dim=0, dim_size=None):
-        if dim != 0:
-            raise NotImplementedError("Fallback scatter_add supports dim=0 only")
-        if dim_size is None:
-            dim_size = int(index.max().item()) + 1
-        out = torch.zeros(dim_size, src.size(1), device=src.device, dtype=src.dtype)
-        # index: (E,) ; src: (E, C)
-        return out.scatter_add_(0, index.unsqueeze(1).expand_as(src), src)
 
 
 class LDPCConvLayer(nn.Module):

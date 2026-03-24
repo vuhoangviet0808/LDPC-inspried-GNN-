@@ -1,4 +1,4 @@
-torch
+torch==2.0.1
 torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
 # torch-sparse @ https://data.pyg.org/whl/torch-2.0.0+cu118.html
 # torch-cluster @ https://data.pyg.org/whl/torch-2.0.0+cu118.html

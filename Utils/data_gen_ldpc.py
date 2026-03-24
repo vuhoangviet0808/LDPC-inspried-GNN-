@@ -63,7 +63,7 @@ def get_cg(n):
 
 
 
-def create_graph(Beta_all, Gamma_all, Eta_all, Phi_all, type='het', isDecentralized=True):
+def create_graph_ldpc(Beta_all, Gamma_all, Eta_all, Phi_all, type='het', isDecentralized=True):
     num_sample, num_AP, num_UE = Beta_all.shape
     data_list = []
     if isDecentralized:
@@ -108,7 +108,7 @@ def full_het_graph(beta_single_sample, gamma_single_sample, eta_single_all, phi_
     x_ue = torch.tensor(ue_features, dtype=torch.float32).to(device)
 
     # Combine AP and UE node features
-    x = {'AP': x_ap, 'UE': x_ue}
+    x = {'CN': x_ap, 'VN': x_ue}
 
     # Define edges (connect AP to all UEs in a bipartite manner)
     edge_index_ap_down_ue = []
@@ -142,12 +142,12 @@ def full_het_graph(beta_single_sample, gamma_single_sample, eta_single_all, phi_
 
     # Create the heterogeneous graph data
     data = HeteroData()
-    data['AP'].x = x['AP']
-    data['UE'].x = x['UE']
-    data['AP', 'down', 'UE'].edge_index = edge_index_ap_down_ue
-    data['AP', 'down', 'UE'].edge_attr = edge_attr_ap_to_ue
-    data['UE', 'up', 'AP'].edge_index = edge_index_ue_up_ap
-    data['UE', 'up', 'AP'].edge_attr = edge_attr_ue_up_ap
+    data['VN'].x = x['VN']
+    data['CN'].x = x['CN']
+    data['VN', 'to', 'CN'].edge_index =  edge_index_ue_up_ap
+    data['VN', 'to', 'CN'].edge_attr =  edge_attr_ue_up_ap
+    data['CN', 'to', 'VN'].edge_index = edge_index_ap_down_ue
+    data['CN', 'to', 'VN'].edge_attr = edge_attr_ap_to_ue
     
     data.y = torch.tensor([eta_single_all], dtype=torch.float32).to(device)
     
@@ -171,16 +171,16 @@ def build_loader(per_ap_datasets, batch_size, seed, drop_last=True, num_workers=
     return loaders
 
 
-def build_cen_loader(betaMatrix, gammaMatrix, etaMatrix, phiMatrix, batchSize, isShuffle=False):
+def build_cen_loader_ldpc(betaMatrix, gammaMatrix, etaMatrix, phiMatrix, batchSize, isShuffle=False):
     log_large_scale = np.log1p(betaMatrix)
-    deta_cen = create_graph(log_large_scale, gammaMatrix, etaMatrix, phiMatrix, 'het', isDecentralized=False)
+    deta_cen = create_graph_ldpc(log_large_scale, gammaMatrix, etaMatrix, phiMatrix, 'het', isDecentralized=False)
     loader_cen = DataLoader(deta_cen, batch_size=batchSize, shuffle=isShuffle)
     return deta_cen, loader_cen
 
 
-def build_decen_loader(betaMatrix, gammaMatrix, etaMatrix, phiMatrix, batchSize, seed=1712):
+def build_decen_loader_ldpc(betaMatrix, gammaMatrix, etaMatrix, phiMatrix, batchSize, seed=1712):
     log_large_scale = np.log1p(betaMatrix)
-    data_decen = create_graph(log_large_scale, gammaMatrix, etaMatrix, phiMatrix, 'het')
+    data_decen = create_graph_ldpc(log_large_scale, gammaMatrix, etaMatrix, phiMatrix, 'het')
     loader_decen = build_loader(data_decen, batchSize, seed=seed, drop_last=False)
     return data_decen, loader_decen
     
